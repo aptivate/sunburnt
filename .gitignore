@@ -1,7 +1,14 @@
 *.pyc
 *.swp
 .cache
+__pycache__
 MANIFEST
 build
 dist
 docs/_build
+venv
+.coverage
+xunit-reports
+.scannerwork
+coverage-reports
+*egg-info

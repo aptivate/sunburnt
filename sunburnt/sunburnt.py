@@ -1,10 +1,16 @@
-from __future__ import absolute_import
-
-import cStringIO as StringIO
+from os import path
+import io
 from itertools import islice
-import socket, time, urllib, urlparse
+import shutil
+import tempfile
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
 import warnings
 
+from lxml import etree
+import requests
 
 from .schema import SolrSchema, SolrError
 from .search import LuceneQuery, MltSolrSearch, SolrSearch, params_from_dict
@@ -12,15 +18,15 @@ from .search import LuceneQuery, MltSolrSearch, SolrSearch, params_from_dict
 MAX_LENGTH_GET_URL = 2048
 # Jetty default is 4096; Tomcat default is 8192; picking 2048 to be conservative.
 
-class SolrConnection(object):
+
+class SolrConnection():
     readable = True
     writeable = True
+
     def __init__(self, url, http_connection, mode, retry_timeout, max_length_get_url, format):
-        if http_connection:
-            self.http_connection = http_connection
-        else:
-            import httplib2
-            self.http_connection = httplib2.Http()
+        self.http_connection = http_connection
+        if not self.http_connection:
+            self.http_connection = requests.Session()
         if mode == 'r':
             self.writeable = False
         elif mode == 'w':
@@ -36,19 +42,17 @@ class SolrConnection(object):
     def request(self, *args, **kwargs):
         try:
             return self.http_connection.request(*args, **kwargs)
-        except socket.error:
+        except requests.exceptions.ConnectionError:
             if self.retry_timeout < 0:
                 raise
             time.sleep(self.retry_timeout)
             return self.http_connection.request(*args, **kwargs)
 
     def commit(self, waitSearcher=None, expungeDeletes=None, softCommit=None):
-        self.update('<commit/>', commit=True,
-                waitSearcher=waitSearcher, expungeDeletes=expungeDeletes, softCommit=softCommit)
+        self.update('<commit/>', commit=True, waitSearcher=waitSearcher, expungeDeletes=expungeDeletes, softCommit=softCommit)
 
     def optimize(self, waitSearcher=None, maxSegments=None):
-        self.update('<optimize/>', optimize=True,
-            waitSearcher=waitSearcher, maxSegments=maxSegments)
+        self.update('<optimize/>', optimize=True, waitSearcher=waitSearcher, maxSegments=maxSegments)
 
     # For both commit & optimize above, we use the XML body instead
     # of the URL parameter, because if we're using POST (which we
@@ -62,16 +66,22 @@ class SolrConnection(object):
             raise TypeError("This Solr instance is only for reading")
         body = update_doc
         if body:
-            headers = {"Content-Type":"text/xml; charset=utf-8"}
+            headers = {"Content-Type": "text/xml; charset=utf-8"}
         else:
             headers = {}
         url = self.url_for_update(**kwargs)
-        r, c = self.request(url, method="POST", body=body,
-                            headers=headers)
-        if r.status != 200:
-            raise SolrError(r, c)
+        response = self.request('POST', url, data=str(body).encode('utf8'), headers=headers)
+        if response.status_code != 200:
+            raise SolrError(response)
 
-    def url_for_update(self, commit=None, commitWithin=None, softCommit=None, optimize=None, waitSearcher=None, expungeDeletes=None, maxSegments=None):
+    def url_for_update(self,
+                       commit=None,
+                       commitWithin=None,
+                       softCommit=None,
+                       optimize=None,
+                       waitSearcher=None,
+                       expungeDeletes=None,
+                       maxSegments=None):
         extra_params = {}
         if commit is not None:
             extra_params['commit'] = "true" if commit else "false"
@@ -102,32 +112,28 @@ class SolrConnection(object):
         if 'maxSegments' in extra_params and 'optimize' not in extra_params:
             raise ValueError("Can't do maxSegments without optimize")
         if extra_params:
-            return "%s?%s" % (self.update_url, urllib.urlencode(sorted(extra_params.items())))
-        else:
-            return self.update_url
+            return "%s?%s" % (self.update_url, urllib.parse.urlencode(sorted(extra_params.items())))
+        return self.update_url
 
     def select(self, params):
         if not self.readable:
             raise TypeError("This Solr instance is only for writing")
         if self.format == 'json':
             params.append(('wt', 'json'))
-        qs = urllib.urlencode(params)
+        qs = urllib.parse.urlencode(params)
         url = "%s?%s" % (self.select_url, qs)
         if len(url) > self.max_length_get_url:
-            warnings.warn("Long query URL encountered - POSTing instead of "
-                "GETting. This query will not be cached at the HTTP layer")
+            warnings.warn("Long query URL encountered - POSTing instead of " "GETting. This query will not be cached at the HTTP layer")
             url = self.select_url
-            kwargs = dict(
-                method="POST",
-                body=qs,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+            method = 'POST'
+            kwargs = {'data': qs, 'headers': {"Content-Type": "application/x-www-form-urlencoded"}}
         else:
-            kwargs = dict(method="GET")
-        r, c = self.request(url, **kwargs)
-        if r.status != 200:
-            raise SolrError(r, c)
-        return c
+            method = 'GET'
+            kwargs = {}
+        response = self.request(method, url, **kwargs)
+        if response.status_code != 200:
+            raise SolrError(response)
+        return response.content
 
     def mlt(self, params, content=None):
         """Perform a MoreLikeThis query using the content specified
@@ -135,60 +141,137 @@ class SolrConnection(object):
         """
         if not self.readable:
             raise TypeError("This Solr instance is only for writing")
-        qs = urllib.urlencode(params)
+        qs = urllib.parse.urlencode(params)
         base_url = "%s?%s" % (self.mlt_url, qs)
+        method = 'GET'
+        kwargs = {}
         if content is None:
-            kwargs = {'uri': base_url, 'method': "GET"}
+            url = base_url
         else:
-            get_url = "%s&stream.body=%s" % (base_url, urllib.quote_plus(content))
+            get_url = "%s&stream.body=%s" % (base_url, urllib.parse.quote_plus(content))
             if len(get_url) <= self.max_length_get_url:
-                kwargs = {'uri': get_url, 'method': "GET"}
+                url = get_url
             else:
-                kwargs = {'uri': base_url, 'method': "POST",
-                    'body': content, 'headers': {"Content-Type": "text/plain; charset=utf-8"}}
-        r, c = self.request(**kwargs)
-        if r.status != 200:
-            raise SolrError(r, c)
-        return c
+                url = base_url
+                method = 'POST'
+                kwargs = {'data': content, 'headers': {"Content-Type": "text/plain; charset=utf-8"}}
+        response = self.request(method, url, **kwargs)
+        if response.status_code != 200:
+            raise SolrError(response)
+        return response.content
 
 
-class SolrInterface(object):
-    remote_schema_file = "admin/file/?file=schema.xml"
-    def __init__(self, url, schemadoc=None, http_connection=None, mode='', retry_timeout=-1,
-            max_length_get_url=MAX_LENGTH_GET_URL, format='xml'):
+class SolrInterface():
+
+    def __init__(self,
+                 url,
+                 schemadoc=None,
+                 http_connection=None,
+                 mode='',
+                 retry_timeout=-1,
+                 max_length_get_url=MAX_LENGTH_GET_URL,
+                 format='xml'):
         self.conn = SolrConnection(url, http_connection, mode, retry_timeout, max_length_get_url, format)
         self.schemadoc = schemadoc
         allowed_formats = ('xml', 'json')
         if format not in allowed_formats:
-            raise ValueError("Unsupported format '%s': allowed are %s" %
-                    (format, ','.join(allowed_formats)))
+            raise ValueError("Unsupported format '%s': allowed are %s" % (format, ','.join(allowed_formats)))
         self.format = format
+        self.file_cache = {}
         self.init_schema()
+
+    def make_file_url(self, filename):
+        return urllib.parse.urljoin(self.conn.url, 'admin/file/?file=') + filename
+
+    def get_file(self, filename):
+        # return remote file as StringIO and cache the contents
+        if filename not in self.file_cache:
+            response = self.conn.request('GET', self.make_file_url(filename))
+            if response.status_code == 200:
+                self.file_cache[filename] = response.content
+            elif response.status_code == 404:
+                return None
+            else:
+                raise EnvironmentError("Couldn't retrieve schema document from server - received status code %s\n%s" %
+                                       (response.status_code, response.content))
+        try:
+            file_string = self.file_cache[filename].encode('utf8')
+        except AttributeError:
+            file_string = self.file_cache[filename]
+        return io.BytesIO(file_string)
+
+    def save_file_cache(self, dirname):
+        # take the file cache and save to a directory
+        for filename in self.file_cache:
+            open(path.join(dirname, filename), 'w').write(self.file_cache[filename])
+
+    def get_xinclude_list_for_file(self, filename):
+        # return a list of xinclude elements in this file
+        file_contents = self.get_file(filename)
+        if file_contents is None:
+            return None
+        tree = etree.parse(self.get_file(filename))
+        return tree.getroot().findall('{http://www.w3.org/2001/XInclude}include')
+
+    def get_file_and_included_files(self, filename):
+        # return a list containing this file, and all files this file includes
+        # via xinclude.  And do this recursively to ensure we have all we need.
+        file_list = [filename]
+        xinclude_list = self.get_xinclude_list_for_file(filename)
+        if xinclude_list is None:
+            # this means we didn't even find the top level file
+            return []
+        for xinclude_node in xinclude_list:
+            included_file = xinclude_node.get('href')
+            file_list += self.get_file_and_included_files(included_file)
+        return file_list
+
+    def get_parsed_schema_file_with_xincludes(self, filename):
+        # get the parsed schema file, and ensure we also get any files
+        # required for any xinclude.  If an xinclude is required, we need
+        # to save the files to the local disk before we call xinclude()
+        try:
+            file_list = self.get_file_and_included_files(filename)
+            if len(file_list) == 0:
+                # this means we didn't even find the top level file
+                raise EnvironmentError("Couldn't retrieve schema document from server - received status code 404\n")
+            if len(file_list) == 1:
+                # there are no xincludes, we can do this the easy way
+                schemadoc = etree.parse(self.get_file(filename))
+            else:
+                # save all contents to files, then load from file and xinclude
+                dirname = tempfile.mkdtemp()
+                try:
+                    self.save_file_cache(dirname)
+                    schemadoc = etree.parse(path.join(dirname, filename))
+                    schemadoc.xinclude()
+                finally:
+                    # delete dirname
+                    shutil.rmtree(dirname)
+        except etree.XMLSyntaxError as e:
+            raise SolrError("Invalid XML in schema:\n%s" % e.args[0])
+        return schemadoc
 
     def init_schema(self):
         if self.schemadoc:
             schemadoc = self.schemadoc
         else:
-            r, c = self.conn.request(
-                urlparse.urljoin(self.conn.url, self.remote_schema_file))
-            if r.status != 200:
-                raise EnvironmentError("Couldn't retrieve schema document from server - received status code %s\n%s" % (r.status, c))
-            schemadoc = StringIO.StringIO(c)
+            schemadoc = self.get_parsed_schema_file_with_xincludes('schema.xml')
         self.schema = SolrSchema(schemadoc, format=self.format)
 
     def add(self, docs, chunk=100, **kwargs):
-        if hasattr(docs, "items") or not hasattr(docs, "__iter__"):
+        if hasattr(docs, "items") or not isinstance(docs, list):
             docs = [docs]
         # to avoid making messages too large, we break the message every
         # chunk docs.
         for doc_chunk in grouper(docs, chunk):
             update_message = self.schema.make_update(doc_chunk)
-            self.conn.update(str(update_message), **kwargs)
+            self.conn.update(update_message, **kwargs)
 
     def delete(self, docs=None, queries=None, **kwargs):
         if not docs and not queries:
             raise SolrError("No docs or query specified for deletion")
-        elif docs is not None and (hasattr(docs, "items") or not hasattr(docs, "__iter__")):
+        if docs is not None and (hasattr(docs, "items") or not isinstance(docs, list)):
             docs = [docs]
         delete_message = self.schema.make_delete(docs, queries)
         self.conn.update(str(delete_message), **kwargs)
@@ -204,7 +287,7 @@ class SolrInterface(object):
 
     def delete_all(self):
         # When deletion is fixed to escape query strings, this will need fixed.
-        self.delete(queries=self.Q(**{"*":"*"}))
+        self.delete(queries=self.Q(**{"*": "*"}))
 
     def search(self, **kwargs):
         params = params_from_dict(**kwargs)
@@ -214,15 +297,13 @@ class SolrInterface(object):
         q = SolrSearch(self)
         if len(args) + len(kwargs) > 0:
             return q.query(*args, **kwargs)
-        else:
-            return q
+        return q
 
     def mlt_search(self, content=None, **kwargs):
         params = params_from_dict(**kwargs)
         return self.schema.parse_response(self.conn.mlt(params, content=content))
 
-    def mlt_query(self, fields=None, content=None, content_charset=None, url=None, query_fields=None,
-                  **kwargs):
+    def mlt_query(self, fields=None, content=None, content_charset=None, url=None, query_fields=None, **kwargs):
         """Perform a similarity query on MoreLikeThisHandler
 
         The MoreLikeThisHandler is expected to be registered at the '/mlt'
