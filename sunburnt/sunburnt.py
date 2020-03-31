@@ -203,7 +203,7 @@ class SolrInterface():
     def save_file_cache(self, dirname):
         # take the file cache and save to a directory
         for filename in self.file_cache:
-            open(path.join(dirname, filename), 'w').write(self.file_cache[filename])
+            open(path.join(dirname, filename), 'wb').write(self.file_cache[filename])
 
     def get_xinclude_list_for_file(self, filename):
         # return a list of xinclude elements in this file
